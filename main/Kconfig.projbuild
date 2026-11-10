@@ -1,0 +1,105 @@
+menu "S31 SD MSC benchmark"
+
+    choice BENCH_SD_SPEED
+        prompt "SD bus speed mode"
+        default BENCH_SD_SPEED_HS
+        help
+            Bus clock used after the card is initialized. The SD bus caps the throughput the
+            USB host can see: 4 data lines x clock / 8 = bytes per second before overhead.
+
+        config BENCH_SD_SPEED_DS
+            bool "Default Speed, 20 MHz (bus max 10 MB/s)"
+        config BENCH_SD_SPEED_HS
+            bool "High Speed, 40 MHz (bus max 20 MB/s)"
+        config BENCH_SD_SPEED_HS50
+            bool "High Speed, 50 MHz (bus max 25 MB/s) - experimental"
+            help
+                SD High Speed mode allows 50 MHz. ESP-IDF uses 40 MHz by default; 50 MHz is
+                derived from MPLL by the driver and was not verified on this board.
+        config BENCH_SD_SPEED_SDR50
+            bool "UHS-I SDR50, 100 MHz, 1.8 V I/O (bus max 50 MB/s) - experimental"
+            depends on SOC_SDMMC_UHS_I_SUPPORTED
+            help
+                The card switches its I/O to 1.8 V (CMD11) and the ESP32-S31 moves the SD I/O
+                supply to the on-chip LDO, as in the ESP-IDF sd_card example. Needs a UHS-I card.
+                If initialization fails after the voltage switch, power-cycle the board
+                (the card keeps 1.8 V signaling until its power is removed).
+    endchoice
+
+    config BENCH_SD_FREQ_KHZ
+        int
+        default 20000 if BENCH_SD_SPEED_DS
+        default 50000 if BENCH_SD_SPEED_HS50
+        default 100000 if BENCH_SD_SPEED_SDR50
+        default 40000
+
+    config BENCH_SD_UHS_LDO_CHAN
+        int "On-chip LDO channel for the 1.8 V SD I/O supply"
+        depends on BENCH_SD_SPEED_SDR50
+        default 1
+        help
+            Same value as EXAMPLE_SD_PWR_CTRL_LDO_IO_ID of the ESP-IDF sd_card example (1 on ESP32-S31).
+
+    choice BENCH_SD_BUS_WIDTH
+        prompt "SD bus width"
+        default BENCH_SD_BUS_WIDTH_4
+        config BENCH_SD_BUS_WIDTH_4
+            bool "4 lines (D0-D3)"
+        config BENCH_SD_BUS_WIDTH_1
+            bool "1 line (D0)"
+    endchoice
+
+    config BENCH_SD_INTERNAL_PULLUP
+        bool "Enable internal pull-ups on the SD lines"
+        default y
+        help
+            Weak internal pull-ups in addition to the board pull-ups (same as the ESP-IDF examples).
+
+    config BENCH_SD_PWR_CTRL
+        bool "Power-cycle the card with a GPIO before initialization"
+        default n
+        help
+            ESP32-S31-Korvo-1 routes SD_CTRL (microSD power/switch control) to GPIO39, which is
+            also a boot strapping pin. Check the board schematic for the polarity before enabling.
+            Not needed normally: the ESP-IDF SDMMC test board definition for this board does not
+            drive the pin. Useful to recover a card stuck in 1.8 V mode after a failed UHS-I init.
+
+    config BENCH_SD_PWR_GPIO
+        int "Card power control GPIO"
+        depends on BENCH_SD_PWR_CTRL
+        range 0 63
+        default 39
+
+    config BENCH_SD_PWR_ON_LEVEL
+        int "GPIO level that turns the card power on"
+        depends on BENCH_SD_PWR_CTRL
+        range 0 1
+        default 0
+
+    config BENCH_SD_PWR_OFF_MS
+        int "Card power-off time (ms)"
+        depends on BENCH_SD_PWR_CTRL
+        range 10 2000
+        default 200
+
+    config BENCH_EXPOSE_AT_BOOT
+        bool "Expose the card to the USB host at boot"
+        default y
+        help
+            If enabled the PC sees the card right after boot. Otherwise the application owns the
+            card (filesystem mounted at /sdcard) until the "expose" console command.
+
+    config BENCH_STATS_PERIOD_MS
+        int "MSC throughput report period (ms)"
+        range 200 10000
+        default 1000
+
+    config BENCH_STATS_IDLE_MS
+        int "Idle time that closes a transfer session (ms)"
+        range 500 30000
+        default 2000
+        help
+            A read or write session summary (bytes, time, MB/s) is printed when the host has not
+            moved data in that direction for this long.
+
+endmenu

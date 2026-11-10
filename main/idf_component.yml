@@ -1,0 +1,6 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf: ">=6.1"
+  # TinyUSB device stack + MSC storage layer (SD/MMC backend)
+  espressif/esp_tinyusb:
+    version: "^2.2.0"
