@@ -21,9 +21,11 @@ menu "S31 SD MSC benchmark"
             depends on SOC_SDMMC_UHS_I_SUPPORTED
             help
                 The card switches its I/O to 1.8 V (CMD11) and the ESP32-S31 moves the SD I/O
-                supply to the on-chip LDO, as in the ESP-IDF sd_card example. Needs a UHS-I card.
-                If initialization fails after the voltage switch, power-cycle the board
-                (the card keeps 1.8 V signaling until its power is removed).
+                supply to the on-chip LDO, as in the ESP-IDF sd_card example. Needs a UHS-I card
+                and BENCH_SD_PWR_CTRL: a card accepts the 1.8 V switch only right after power-up.
+                If the card refuses, the firmware falls back to High Speed 40 MHz.
+                Verified on Korvo-1 V1.1 with a 512 GB SDXC card: raw read 48 MB/s,
+                exFAT 1 GiB file write 29 MB/s / read 46 MB/s, data verified.
     endchoice
 
     config BENCH_SD_FREQ_KHZ
@@ -57,12 +59,14 @@ menu "S31 SD MSC benchmark"
 
     config BENCH_SD_PWR_CTRL
         bool "Power-cycle the card with a GPIO before initialization"
-        default n
+        default y
         help
-            ESP32-S31-Korvo-1 routes SD_CTRL (microSD power/switch control) to GPIO39, which is
-            also a boot strapping pin. Check the board schematic for the polarity before enabling.
-            Not needed normally: the ESP-IDF SDMMC test board definition for this board does not
-            drive the pin. Useful to recover a card stuck in 1.8 V mode after a failed UHS-I init.
+            ESP32-S31-Korvo-1 V1.1 schematic: SD_CTRL = GPIO39 drives the gate of Q1 (AO3401A,
+            P-MOSFET) between VCC_3V3 and the card supply SD_3V3. R138 (10k) pulls the gate low,
+            so low = card on, high = card off. GPIO39 is also a boot strapping pin; it is driven
+            only after boot.
+            A chip reset does not remove the card supply. Without this power cycle a card that was
+            initialized before stays in its old state and refuses the UHS-I 1.8 V switch.
 
     config BENCH_SD_PWR_GPIO
         int "Card power control GPIO"
@@ -79,8 +83,10 @@ menu "S31 SD MSC benchmark"
     config BENCH_SD_PWR_OFF_MS
         int "Card power-off time (ms)"
         depends on BENCH_SD_PWR_CTRL
-        range 10 2000
-        default 200
+        range 10 5000
+        default 1000
+        help
+            SD_3V3 has 10 uF and no bleeder resistor; the card itself discharges it.
 
     config BENCH_EXPOSE_AT_BOOT
         bool "Expose the card to the USB host at boot"

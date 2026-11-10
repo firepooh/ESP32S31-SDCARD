@@ -16,6 +16,16 @@ CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 
+# microSD: UHS-I SDR50 (100 MHz, 1.8 V signaling, 50 MB/s bus). The card accepts the 1.8 V
+# switch only after a fresh power-up, so SD_CTRL (GPIO39, low = on) power-cycles it at boot.
+# If the card refuses UHS-I the firmware falls back to High Speed 40 MHz.
+CONFIG_BENCH_SD_SPEED_SDR50=y
+CONFIG_BENCH_SD_UHS_LDO_CHAN=1
+CONFIG_BENCH_SD_PWR_CTRL=y
+CONFIG_BENCH_SD_PWR_GPIO=39
+CONFIG_BENCH_SD_PWR_ON_LEVEL=0
+CONFIG_BENCH_SD_PWR_OFF_MS=1000
+
 # Performance
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_320=y

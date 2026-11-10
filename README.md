@@ -1,7 +1,7 @@
 # ESP32-S31-Korvo-1 microSD USB High-Speed MSC 속도 측정
 
-> **상태**: ESP-IDF v6.1에서 빌드까지 확인했다. 보드에서는 아직 실행하지 않았다.
-> 보드에서 확인할 항목은 [확인한 범위](#확인한-범위)에 정리했다.
+> **상태**: 보드에서 SD 카드 동작(High Speed 40 MHz, UHS-I SDR50 100 MHz)과 512 GB exFAT 마운트를 확인했다.
+> 측정값은 [벤치 결과](#벤치-결과)에 있다. USB로 PC에 연결한 측정은 아직 하지 않았다.
 
 ## 사용 보드
 
@@ -27,12 +27,136 @@
 - **장치 단독**: 카드를 앱으로 가져와 SD 원시 읽기 속도와 exFAT 파일 쓰기·읽기 속도를 잰다.
   USB를 거치지 않으므로 SD 버스 한계와 USB 한계를 나눠 볼 수 있다.
 
+## 벤치 결과
+
+2026-11-10에 보드 단독으로 측정했다(USB 미연결). 속도 단위 MB/s는 1 MB = 10^6 B 기준이다.
+
+| 항목 | 내용 |
+|---|---|
+| 보드 | ESP32-S31-Korvo-1 V1.1, CPU 320 MHz |
+| 카드 | 삼성 microSDXC 512 GB (CID PNM "EF8S5", SD 3.0, UHS-I, AU 4 MB) |
+| 파일시스템 | exFAT, 클러스터 256 KiB, 데이터 영역 4 MB 정렬 |
+| SD 버스 | 4비트. High Speed 40 MHz(3.3 V 신호)와 UHS-I SDR50 100 MHz(1.8 V 신호)를 비교했다 |
+| 펌웨어 | 이 저장소, ESP-IDF v6.1 |
+
+### 원시 순차 읽기 (`rawread`)
+
+카드 중간 위치에서 SD 명령 크기별로 64 MiB 또는 5초씩 읽었다. 파일시스템을 거치지 않는다.
+
+| SD 명령 크기 | High Speed 40 MHz (MB/s) | UHS-I SDR50 100 MHz (MB/s) | SDR50 / HS |
+|---|---|---|---|
+| 4 KiB | 10.68 | 13.69 | 1.3배 |
+| 16 KiB | 15.98 | 29.54 | 1.8배 |
+| 32 KiB | 17.54 | 36.27 | 2.1배 |
+| 64 KiB | 18.44 | 41.54 | 2.3배 |
+| 128 KiB | 18.92 | 44.87 | 2.4배 |
+| 256 KiB | 19.18 | 46.69 | 2.4배 |
+| 512 KiB | 19.30 | 47.61 | 2.5배 |
+| 1024 KiB | **19.37** | **48.08** | 2.5배 |
+| 버스 이론 상한 | 20 | 50 | 2.5배 |
+
+- 명령이 크면 두 모드 모두 버스 이론 상한의 96~97 %까지 나온다.
+- 명령이 작으면 클럭을 올려도 덜 빨라진다. 명령마다 명령·응답 교환과 카드 준비에 드는 고정 시간이 있기 때문이다.
+  4 KiB 명령 한 번에 High Speed는 384 µs, SDR50은 299 µs가 걸렸다.
+- USB MSC 경로는 SD를 32 KiB 단위로 읽고 쓴다. 그래서 32 KiB 행이 USB 연결 때 SD 쪽 상한에 가깝다.
+
+### exFAT 파일 쓰기·읽기 (`filebench -s 1024`)
+
+1 GiB 파일을 256 KiB씩 쓰고 다시 읽은 뒤, 512바이트마다 데이터를 검증했다.
+
+| 모드 | 쓰기 (MB/s) | 읽기 (MB/s) | 데이터 검증 |
+|---|---|---|---|
+| High Speed 40 MHz | 14.48 | 18.91 | OK |
+| UHS-I SDR50 100 MHz | **29.15** | **45.58** | OK |
+
+- 쓰기는 클러스터(256 KiB)마다 SD 명령 하나로 나간다. 평균 명령 크기는 255.6 KiB였다.
+- 256 KiB 쓰기 한 번은 버스 전송 시간에 카드 내부 기록 시간이 더해진다.
+  - SDR50: 약 9.0 ms = 버스 전송 5.2 ms + 카드 기록 약 3.7 ms
+  - High Speed 40 MHz: 약 18.1 ms = 버스 전송 13.1 ms + 카드 기록 약 5.0 ms
+- 그래서 쓰기는 버스 상한보다 낮고, 카드 자체 성능의 영향을 크게 받는다.
+
+SDR50에서 읽기 명령 29,605회(1,611 MB)와 쓰기 명령 4,103회(1,074 MB)를 실행했다. SD 오류는 없었다.
+
+## UHS-I SDR50 동작
+
+### 요약
+
+- 이번 카드는 UHS-I를 지원한다. 1.8 V 전환 요청에 S18A=1로 응답했다.
+- ESP32-S31의 SDMMC 슬롯 0은 SD 3.0(SDIO 3.0)의 UHS-I를 지원한다.
+- 1.8 V 전환은 칩 안에서 자동으로 이뤄진다.
+  CMD11 전환 때 IDF 드라이버가 SD I/O 패드 전원을 칩 내부 LDO(1.8 V)로 바꾼다.
+- Korvo-1에는 SD용 외부 LDO나 레벨 시프터가 없다.
+  SD 신호선이 S31 슬롯 0 핀(GPIO20~25)에 바로 연결돼 있다(회로도 "SDIO 3.0 Host" 블록).
+- 세 조건이 모두 맞아 SDR50 100 MHz로 동작했다.
+
+### SDR50의 뜻과 속도 계산
+
+SDR50은 UHS-I의 "Single Data Rate, 50 MB/s" 모드다.
+
+- 클럭은 100 MHz이고, 클럭 상승 에지마다 데이터선 4개(DAT0~3)로 4비트를 보낸다.
+- 버스 속도 = 100 MHz × 4비트 ÷ 8 = **50 MB/s**. 비트 하나의 시간은 10 ns다.
+- 이름의 50은 클럭(MHz)이 아니라 버스 속도(MB/s)다.
+- 측정한 원시 읽기 48.08 MB/s는 이 상한의 96 %다.
+
+| 모드 | 신호 전압 | 클럭 | 샘플링 | 버스 상한 | ESP32-S31 (IDF v6.1) |
+|---|---|---|---|---|---|
+| Default Speed | 3.3 V | 25 MHz (IDF는 20 MHz) | 상승 에지 | 12.5 MB/s | 지원 |
+| High Speed | 3.3 V | 50 MHz (IDF 기본 40 MHz) | 상승 에지 | 25 MB/s | 지원 |
+| UHS-I SDR50 | 1.8 V | 100 MHz | 상승 에지 | 50 MB/s | 지원, 이 보드에서 확인 |
+| UHS-I DDR50 | 1.8 V | 50 MHz | 상승·하강 에지 | 50 MB/s | 드라이버 미지원 |
+| UHS-I SDR104 | 1.8 V | 208 MHz | 상승 에지 | 104 MB/s | 드라이버 미지원 |
+
+DDR50은 클럭을 50 MHz로 낮추고 양쪽 에지에서 샘플링해 같은 50 MB/s를 낸다.
+
+### 1.8 V 전환 순서
+
+1. 카드 전원을 켠다. 3.3 V 신호, 400 kHz 클럭으로 시작한다.
+2. CMD0으로 카드를 초기화하고, CMD8로 동작 전압을 확인한다.
+3. ACMD41에서 호스트가 S18R 비트로 1.8 V를 요청하고, 카드가 S18A=1로 수락한다.
+4. CMD11로 카드와 S31이 신호를 1.8 V로 바꾼다. 이때 S31은 SD I/O 패드 전원을 내부 LDO로 바꾼다.
+5. CMD6로 SDR50 기능을 고른다.
+6. 호스트 클럭을 100 MHz로 올린다.
+7. CMD19 튜닝으로 데이터 샘플링 시점을 고른다. 이 보드에서는 지연 단계 2가 선택됐다.
+
+카드 전원(VDD)은 UHS-I에서도 3.3 V(SD_3V3)다. 1.8 V로 바뀌는 것은 CLK, CMD, DAT0~3 신호선뿐이다.
+
+### 카드 전원 재인가 (GPIO39)
+
+- 카드는 전원이 새로 들어온 직후에만 1.8 V 전환을 수락한다. 한 번 1.8 V로 바뀌면 전원이 꺼질 때까지 그대로 유지한다.
+- 칩 리셋이나 플래시 후 리셋으로는 카드 전원이 끊기지 않는다. 첫 시험에서 카드가 S18A=0으로 거절한 이유다.
+- Korvo-1은 SD_CTRL(GPIO39)로 카드 전원 스위치 Q1(AO3401A, P-MOSFET)을 제어한다. LOW = 켜짐, HIGH = 꺼짐이다.
+- 펌웨어는 부팅 때마다 GPIO39로 카드 전원을 1초 끊는다.
+- 끊는 동안 SD 신호선을 LOW로 둔다. 신호선으로 카드에 전원이 새어 들어가지 않게 하고, 방전 저항이 없는 SD_3V3의 10 µF를 비우기 위해서다.
+
+### 카드가 전환을 거절할 때
+
+- IDF 드라이버는 카드가 3.3 V High Speed에 머물러도 요청한 100 MHz를 그대로 적용한다. High Speed 규격 상한(50 MHz)의 2배다.
+- 펌웨어는 이 경우를 감지해 High Speed 40 MHz로 내려가고 경고 로그를 남긴다.
+
+### SDR50 정상 진입 부팅 로그
+
+```
+I sd: card power cycled with GPIO39 (off 1000 ms, on level 0)
+I sd: slot 0, 4-bit, requested mode: UHS-I SDR50 100 MHz
+I sdmmc_sd: sdmmc_do_timing_tuning: proper delay phase/line id: 2
+Type: SDHC/SDXC (UHS-I)
+Bus: 4-bit, UHS-I SDR50 100 MHz, UHS-I active, clock 100000 kHz (card limit 100000 kHz)
+OCR: 0xc1ff8000 (CCS 1, S18A 1) | host sent S18R: yes
+```
+
+### 설정과 확인 범위
+
+- menuconfig `S31 SD MSC benchmark`에서 `SD bus speed mode`를 `UHS-I SDR50`으로 고른다.
+  `Power-cycle the card with a GPIO`는 켜 둔다(기본값).
+- 프로토콜 수준에서 확인했다. S18A=1, CMD11 전환, 튜닝 통과, 100 MHz에서 약 2.7 GB를 오류 없이 주고받았다.
+- 신호선의 실제 전압(약 1.8 V 진폭)은 오실로스코프로 재지 않았다.
+
 ## 보드 연결
 
 | 항목 | 내용 |
 |---|---|
 | microSD | SDMMC 슬롯 0, 4비트. CLK GPIO24, CMD GPIO25, D0~D3 GPIO20~23 (IO MUX 고정 핀) |
-| SD_CTRL | GPIO39 (카드 전원 제어). 기본 설정에서는 건드리지 않는다 |
+| SD_CTRL | GPIO39. 카드 전원 스위치 Q1(AO3401A, P-MOSFET)의 게이트. LOW = 켜짐, HIGH = 꺼짐 (R138 풀다운으로 부팅 때 켜짐) |
 | USB MSC | USB 2.0 Type-A 포트 (ESP32-S31 High-Speed OTG, UTMI PHY) |
 | 콘솔 | USB-to-UART Type-C 포트 (UART0, GPIO58/59), 115200 bps |
 
@@ -95,28 +219,17 @@ idf.py --preview -p COM4 flash monitor
 
 | 항목 | 기본값 | 설명 |
 |---|---|---|
-| SD bus speed mode | High Speed 40 MHz | Default Speed 20 MHz, High Speed 40 MHz, High Speed 50 MHz(실험), UHS-I SDR50 100 MHz(실험) |
+| SD bus speed mode | **UHS-I SDR50 100 MHz** | Default Speed 20 MHz, High Speed 40 MHz, High Speed 50 MHz(실험), UHS-I SDR50 100 MHz(보드에서 확인). 카드가 UHS-I를 거절하면 High Speed 40 MHz로 내려간다 |
 | SD bus width | 4 lines | 1비트로 바꿀 수 있다 |
 | Enable internal pull-ups | 켬 | 보드 풀업에 내부 풀업을 더한다 (IDF 예제와 같다) |
 | On-chip LDO channel | 1 | SDR50에서만 쓴다. IDF sd_card 예제의 ESP32-S31 값과 같다 |
-| Power-cycle the card with a GPIO | 끔 | GPIO39로 카드 전원을 껐다 켠다. 극성을 회로도에서 확인한 뒤 켠다 |
+| Power-cycle the card with a GPIO | 켬 | 부팅 때 GPIO39로 카드 전원을 1초 끊었다가 켠다. UHS-I에 필요하다 |
 | Expose the card to the USB host at boot | 켬 | 부팅 직후 PC가 카드를 쓸 수 있다 |
 | MSC throughput report period | 1000 ms | `[msc]` 줄 출력 주기 |
 | Idle time that closes a transfer session | 2000 ms | 이 시간 동안 전송이 없으면 세션 요약을 출력한다 |
 
-SD 버스의 이론 상한은 4비트 × 클럭 ÷ 8이다.
-
-| 모드 | 클럭 | 버스 상한 |
-|---|---|---|
-| Default Speed | 20 MHz | 10 MB/s |
-| High Speed | 40 MHz | 20 MB/s |
-| High Speed (50 MHz) | 50 MHz | 25 MB/s |
-| UHS-I SDR50 | 100 MHz | 50 MB/s |
-
-UHS-I SDR50은 카드에 1.8 V 신호를 요청(S18R)하고 CMD11로 전환한다.
-전환 뒤에는 칩 내부 LDO가 SD I/O 전원을 1.8 V로 공급한다.
-카드는 전원이 꺼질 때까지 1.8 V 신호를 유지한다. 초기화가 실패하면 보드 전원을 껐다 켠다.
-IDF v6.1의 ESP32-S31 SDMMC 드라이버는 DDR50과 SDR104를 지원하지 않는다.
+기본값은 `sdkconfig.defaults`에 있다.
+모드별 클럭과 버스 상한, 1.8 V 전환 과정은 [UHS-I SDR50 동작](#uhs-i-sdr50-동작)에 정리했다.
 
 ## exFAT 지원
 
@@ -215,7 +328,8 @@ PC 측 값이 SD 버스 상한보다 많이 낮으면 다음을 확인한다.
 - 쓰기는 USB 수신과 이전 블록의 SD 쓰기가 일부 겹친다. esp_tinyusb가 SD 쓰기를 TinyUSB 태스크로 미뤄 처리하기 때문이다.
 - PC가 보내는 큰 READ(10)/WRITE(10)도 장치 안에서는 32 KiB 단위로 나뉜다.
   ESP32-S31의 MSC 버퍼 상한이 32 KiB(`CONFIG_TINYUSB_MSC_BUFSIZE`)이기 때문이다.
-  그래서 `rawread`의 32 KiB 행이 MSC 경로의 SD 성능에 가장 가깝다. `stats`의 평균 명령 크기로 확인할 수 있다.
+  그래서 `rawread`의 32 KiB 행이 MSC 경로의 SD 성능에 가장 가깝다(High Speed 17.54 MB/s, SDR50 36.27 MB/s).
+  `stats`의 평균 명령 크기로 확인할 수 있다.
 - 파일시스템 정렬도 쓰기 속도에 영향을 준다.
   `info`가 데이터 영역이 AU 경계에 있지 않다고 표시하면 카드를 다시 포맷한다.
   SD Association의 SD Memory Card Formatter나 `format --yes`를 쓴다.
@@ -246,10 +360,12 @@ PC 측 값이 SD 버스 상한보다 많이 낮으면 다음을 확인한다.
 - `tools/msc_bench.py`를 PC의 로컬 NTFS 드라이브에서 실행했다.
   쓰기, 읽기, 검증, 테스트 파일 삭제가 동작했다.
 
-보드에서 아직 확인하지 않은 것:
+- 보드에서 부팅, PSRAM(Octal 200 MHz), 512 GB 카드 인식, exFAT 진단과 마운트가 정상이었다.
+- 측정값은 [벤치 결과](#벤치-결과), SDR50 진입 과정은 [UHS-I SDR50 동작](#uhs-i-sdr50-동작)에 있다.
 
-- 보드에서 실행해 보지 않았다. 카드 인식, USB 열거, 측정값 모두 확인이 필요하다.
+아직 확인하지 않은 것:
+
+- USB로 PC에 연결한 측정(USB 열거, MSC 속도)
 - Type-A 포트를 PC에 연결할 때의 VBUS 처리(위 주의 참고)
-- High Speed 50 MHz와 UHS-I SDR50 동작
-- GPIO39(SD_CTRL)의 극성
-- PSRAM 설정(Octal, 200 MHz)은 같은 모듈을 쓰는 ESP32S31-CANFD 프로젝트 설정을 따랐다.
+- SD 신호선의 실제 1.8 V 진폭(오실로스코프 측정)
+- High Speed 50 MHz 동작

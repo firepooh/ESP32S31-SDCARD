@@ -15,6 +15,7 @@
 #include "driver/gpio.h"
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
+#include "sd_protocol_defs.h"
 #if CONFIG_BENCH_SD_SPEED_SDR50
 #include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #endif
@@ -30,6 +31,10 @@ static const char *TAG = "sd";
 #define SD_BUS_WIDTH        4
 #endif
 
+#if CONFIG_BENCH_SD_SPEED_SDR50
+static bool s_uhs_fallback;     // SDR50 requested but the card kept 3.3 V signaling
+#endif
+
 const char *sd_card_mode_name(void)
 {
 #if CONFIG_BENCH_SD_SPEED_DS
@@ -37,32 +42,65 @@ const char *sd_card_mode_name(void)
 #elif CONFIG_BENCH_SD_SPEED_HS50
     return "High Speed 50 MHz";
 #elif CONFIG_BENCH_SD_SPEED_SDR50
-    return "UHS-I SDR50 100 MHz";
+    return s_uhs_fallback ? "High Speed 40 MHz (UHS-I SDR50 requested, card stayed at 3.3 V)"
+                          : "UHS-I SDR50 100 MHz";
 #else
     return "High Speed 40 MHz";
 #endif
 }
 
+/*
+ * Korvo-1: SD_CTRL (GPIO39) drives the gate of Q1 (AO3401A, P-MOSFET) between VCC_3V3 and the
+ * card supply SD_3V3. R138 pulls the gate low, so the card is powered at boot; GPIO39 high turns
+ * it off. A card keeps 1.8 V signaling until its supply is removed, and accepts the 1.8 V switch
+ * (S18A) only after a fresh power-up, so UHS-I needs this power cycle on every boot.
+ */
 static void card_power_cycle(void)
 {
 #if CONFIG_BENCH_SD_PWR_CTRL
     const int pin = CONFIG_BENCH_SD_PWR_GPIO;
     const int on = CONFIG_BENCH_SD_PWR_ON_LEVEL;
+    const sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    const gpio_num_t sd_pins[] = { slot.clk, slot.cmd, slot.d0, slot.d1, slot.d2, slot.d3 };
+    uint64_t sd_mask = 0;
+    for (size_t i = 0; i < sizeof(sd_pins) / sizeof(sd_pins[0]); i++) {
+        sd_mask |= BIT64(sd_pins[i]);
+    }
+
+    // Hold the SD lines low while the card is off: no supply through the I/O pins, and the
+    // 10 uF on SD_3V3 (no bleeder resistor) discharges into the card.
+    const gpio_config_t sd_io = {
+        .pin_bit_mask = sd_mask,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&sd_io);
+    for (size_t i = 0; i < sizeof(sd_pins) / sizeof(sd_pins[0]); i++) {
+        gpio_set_level(sd_pins[i], 0);
+    }
 
     gpio_set_level(pin, !on);
-    gpio_config_t io = {
+    gpio_config_t pwr_io = {
         .pin_bit_mask = BIT64(pin),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    gpio_config(&io);
+    gpio_config(&pwr_io);
     gpio_set_level(pin, !on);
     vTaskDelay(pdMS_TO_TICKS(CONFIG_BENCH_SD_PWR_OFF_MS));
+
+    // Power the card again, then release the SD lines. gpio_reset_pin() also drops the output
+    // reservation, so sdmmc_host_init_slot() takes the pins without a GPIO conflict warning.
     gpio_set_level(pin, on);
-    vTaskDelay(pdMS_TO_TICKS(20));  // let the card supply settle
-    ESP_LOGI(TAG, "card power cycled with GPIO%d (on level %d)", pin, on);
+    for (size_t i = 0; i < sizeof(sd_pins) / sizeof(sd_pins[0]); i++) {
+        gpio_reset_pin(sd_pins[i]);
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));  // supply ramp-up and the card's power-up time
+    ESP_LOGI(TAG, "card power cycled with GPIO%d (off %d ms, on level %d)", pin, CONFIG_BENCH_SD_PWR_OFF_MS, on);
 #endif
 }
 
@@ -120,6 +158,23 @@ esp_err_t sd_card_init(sdmmc_card_t **out_card)
         vTaskDelay(pdMS_TO_TICKS(SD_INIT_RETRY_MS));
     }
 
+#if CONFIG_BENCH_SD_SPEED_SDR50
+    if (!card->is_uhs1) {
+        // The card answered without S18A and stayed in 3.3 V High Speed mode. The driver still
+        // applies host.max_freq_khz, which would clock a High Speed card at 100 MHz (spec: 50 MHz).
+        // A card only accepts the 1.8 V switch after its power was removed; a chip reset is not enough.
+        ESP_LOGW(TAG, "card did not switch to UHS-I 1.8 V signaling; power-cycle the card to retry. "
+                      "Falling back to High Speed %d kHz", SDMMC_FREQ_HIGHSPEED);
+        ESP_RETURN_ON_ERROR(card->host.set_card_clk(card->host.slot, SDMMC_FREQ_HIGHSPEED), TAG, "set clock");
+        card->max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+        int real_khz = 0;
+        if (card->host.get_real_freq && card->host.get_real_freq(card->host.slot, &real_khz) == ESP_OK) {
+            card->real_freq_khz = real_khz;
+        }
+        s_uhs_fallback = true;
+    }
+#endif
+
     *out_card = card;
     return ESP_OK;
 }
@@ -148,4 +203,13 @@ void sd_card_print_info(const sdmmc_card_t *card)
            1 << card->log_bus_width, sd_card_mode_name(),
            card->is_uhs1 ? "active" : "off",
            card->real_freq_khz, card->max_freq_khz);
+
+    // ACMD41 handshake: the host sets S18R to ask for 1.8 V, the card answers S18A=1 if it agrees.
+    bool s18r = false;
+    if (card->host.is_slot_set_to_uhs1) {
+        card->host.is_slot_set_to_uhs1(card->host.slot, &s18r);
+    }
+    printf("OCR: 0x%08" PRIx32 " (CCS %d, S18A %d) | host sent S18R: %s\n", card->ocr,
+           (card->ocr & SD_OCR_SDHC_CAP) ? 1 : 0, (card->ocr & SD_OCR_S18_RA) ? 1 : 0,
+           s18r ? "yes" : "no");
 }
