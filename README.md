@@ -9,10 +9,25 @@
 | 항목 | 내용 |
 |---|---|
 | 보드 | Espressif [ESP32-S31-Korvo-1](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-korvo-1/index.html) V1.1 |
+| 사용자 가이드 | [ESP32-S31-Korvo-1 V1.1 User Guide](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-korvo-1/user_guide.html) |
 | 모듈 | ESP32-S31-WROOM-3 (플래시 16 MB, PSRAM 16 MB) |
 | 사용 기능 | microSD 슬롯(4비트 SDMMC), USB 2.0 Type-A 포트(High-Speed OTG), USB-to-UART 콘솔 |
 | SD 카드 | 64 GB 이상 microSDXC, exFAT (FAT32 카드도 쓸 수 있다) |
 | 개발 환경 | ESP-IDF v6.1 (Windows), esp_tinyusb 2.2.0 |
+
+![ESP32-S31-Korvo-1 V1.1 보드 구성](docs/images/esp32-s31-korvo-1.webp)
+
+이 프로젝트에서 쓰는 부분은 사진 번호로 다음과 같다.
+
+| 번호 | 부분 | 용도 |
+|---|---|---|
+| (2) | USB Type-C 포트 (UART) | 전원, 플래시, 콘솔 (COM 포트) |
+| (4) | 전원 스위치 | 보드 5 V 전원 |
+| (5) | USB 2.0 Type-A 포트 | USB High-Speed MSC (PC 연결) |
+| (22) | ESP32-S31-WROOM-3 | MCU 모듈 |
+| (23) | microSD 카드 슬롯 | 측정 대상 카드 (SDMMC 슬롯 0, UHS-I) |
+
+사진 출처: Espressif [ESP32-S31-Korvo-1 V1.1 사용자 가이드](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-korvo-1/user_guide.html)
 
 ## 목적
 
@@ -184,6 +199,7 @@ DDR50은 클럭을 50 MHz로 낮추고 양쪽 에지에서 샘플링해 같은 5
 - 카드는 전원이 새로 들어온 직후에만 1.8 V 전환을 수락한다. 한 번 1.8 V로 바뀌면 전원이 꺼질 때까지 그대로 유지한다.
 - 칩 리셋이나 플래시 후 리셋으로는 카드 전원이 끊기지 않는다. 첫 시험에서 카드가 S18A=0으로 거절한 이유다.
 - Korvo-1은 SD_CTRL(GPIO39)로 카드 전원 스위치 Q1(AO3401A, P-MOSFET)을 제어한다. LOW = 켜짐, HIGH = 꺼짐이다.
+  회로는 [microSD 회로](#microsd-회로)에 있다.
 - 펌웨어는 부팅 때마다 GPIO39로 카드 전원을 1초 끊는다.
 - 끊는 동안 SD 신호선을 LOW로 둔다. 신호선으로 카드에 전원이 새어 들어가지 않게 하고, 방전 저항이 없는 SD_3V3의 10 µF를 비우기 위해서다.
 
@@ -219,6 +235,24 @@ OCR: 0xc1ff8000 (CCS 1, S18A 1) | host sent S18R: yes
 | USB MSC | USB 2.0 Type-A 포트 (ESP32-S31 High-Speed OTG, UTMI PHY) |
 | 콘솔 | USB-to-UART Type-C 포트 (UART0, GPIO58/59), 115200 bps |
 
+### microSD 회로
+
+![ESP32-S31-Korvo-1 V1.1 microSD 회로 (SDIO 3.0 Host)](docs/images/esp32-s31-korvo-1-sd-circuit.png)
+
+회로도 출처: Espressif ESP32-S31-Korvo-1 V1.1 회로도 ("SDIO 3.0 Host" 블록)
+
+| 부분 | 회로 | 펌웨어와의 관계 |
+|---|---|---|
+| 신호선 | GPIO20~25가 0 Ω 저항(R7, R65~R69)만 거쳐 카드의 D0~D3, CLK, CMD에 연결된다. 레벨 시프터가 없다 | 신호 전압은 S31 패드 전원이 정한다. UHS-I 때 칩 내부 LDO가 1.8 V로 바꾼다 |
+| SPI NAND 겸용 | 같은 GPIO가 R22, R23, R1~R4(NC)를 거쳐 NAND 플래시 자리로도 갈 수 있다 | 기본 조립 상태에서는 NC라 microSD만 연결된다 |
+| 풀업 | 신호선에 외부 풀업 저항이 없다 | 칩 내부 풀업을 켠다(`Enable internal pull-ups`). 3.3 V 외부 풀업이 없어서 1.8 V 신호와 충돌하지 않는다 |
+| 카드 전원 | VCC_3V3이 Q1(AO3401A, P-MOSFET)을 거쳐 SD_3V3(카드 VDD)이 된다 | UHS-I에 필요한 카드 전원 재인가에 쓴다 |
+| SD_CTRL | Q1 게이트 = GPIO39. R138 10 kΩ 풀다운, R70(풀업)은 NC | LOW = 켜짐, HIGH = 꺼짐. 부팅 때 펌웨어가 1초 동안 HIGH로 둔다 |
+| 디커플링 | SD_3V3에 C1 10 µF, C16 0.1 µF. 방전 저항은 없다 | 전원을 끄는 동안 신호선을 LOW로 두어 카드 쪽으로 전원이 새지 않게 한다 |
+| ESD | 모든 신호선과 SD_DET에 BSDFN2C031U | - |
+| 카드 감지 | 카드 CD 핀이 SD_DET로 나와 TP5에 연결된다 | 이 회로도 범위에서는 GPIO에 연결되지 않아 펌웨어는 카드 감지를 쓰지 않는다 |
+| 배선 | 단일 종단 50 Ω, 길이 맞춤(3 mil 이내), 3 cm 이하 | 100 MHz(SDR50) 동작의 전제 조건이다 |
+
 ### 연결 순서
 
 1. Type-C UART 포트를 PC에 연결한다. 전원, 플래시, 콘솔을 모두 이 포트로 쓴다.
@@ -251,6 +285,7 @@ main/
   Kconfig.projbuild       menuconfig "S31 SD MSC benchmark"
   idf_component.yml       espressif/esp_tinyusb ^2.2.0
 components/fatfs/         ESP-IDF v6.1 fatfs 복사본 (exFAT 켬)
+docs/images/              보드 사진, microSD 회로도
 tools/msc_bench.py        PC 측 순차 쓰기·읽기 측정 (Windows)
 ```
 
