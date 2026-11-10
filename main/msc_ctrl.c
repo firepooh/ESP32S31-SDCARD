@@ -36,11 +36,19 @@
 #include "tinyusb_msc.h"
 #include "tusb.h"
 #include "msc_ctrl.h"
+#if CONFIG_BENCH_MSC_FAST_IO
+#include "msc_io.h"
+#endif
 
 static const char *TAG = "msc";
 
 #define SCSI_ASC_MEDIUM_NOT_PRESENT     0x3A
 #define SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED 0x28   // "not ready to ready change, medium may have changed"
+#define SCSI_ASC_WRITE_ERROR            0x0C
+#define SCSI_OP_PREVENT_ALLOW_REMOVAL   0x1E
+#define SCSI_OP_SYNCHRONIZE_CACHE_10    0x35
+#define SCSI_OP_SYNCHRONIZE_CACHE_16    0x91
+#define MSC_BLOCK                       512u
 #define TAKE_DRAIN_MS                   100     // let a deferred WRITE(10) in the TinyUSB task finish
 #define HOST_RECENT_IO_US               (3 * 1000 * 1000LL)
 #define SESSION_MIN_REPORT_BYTES        (1000 * 1000ULL)
@@ -76,6 +84,8 @@ static SemaphoreHandle_t s_bounce_mutex;
 bool __real_tud_msc_test_unit_ready_cb(uint8_t lun);
 int32_t __real_tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize);
 int32_t __real_tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize);
+int32_t __real_tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, uint16_t bufsize);
+int32_t __wrap_tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, uint16_t bufsize);
 esp_err_t __real_sdmmc_read_sectors(sdmmc_card_t *card, void *dst, size_t start_sector, size_t sector_count);
 esp_err_t __real_sdmmc_write_sectors(sdmmc_card_t *card, const void *src, size_t start_sector, size_t sector_count);
 
@@ -124,7 +134,20 @@ int32_t __wrap_tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, voi
         return -1;
     }
     const int64_t t0 = esp_timer_get_time();
-    const int32_t ret = __real_tud_msc_read10_cb(lun, lba, offset, buffer, bufsize);
+    int32_t ret;
+#if CONFIG_BENCH_MSC_FAST_IO
+    if (offset == 0 && bufsize % MSC_BLOCK == 0) {
+        ret = msc_io_read(lba, buffer, bufsize);
+        if (ret < 0) {
+            tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);   // unrecovered read error
+        }
+    } else {
+        msc_io_flush();     // unusual partial-block access: use the esp_tinyusb path
+        ret = __real_tud_msc_read10_cb(lun, lba, offset, buffer, bufsize);
+    }
+#else
+    ret = __real_tud_msc_read10_cb(lun, lba, offset, buffer, bufsize);
+#endif
     const int64_t t1 = esp_timer_get_time();
     if (ret > 0) {
         portENTER_CRITICAL(&s_lock);
@@ -143,7 +166,21 @@ int32_t __wrap_tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, ui
         return -1;
     }
     const int64_t t0 = esp_timer_get_time();
-    const int32_t ret = __real_tud_msc_write10_cb(lun, lba, offset, buffer, bufsize);
+    int32_t ret;
+#if CONFIG_BENCH_MSC_FAST_IO
+    if (offset == 0 && bufsize % MSC_BLOCK == 0) {
+        ret = msc_io_write(lba, buffer, bufsize);
+        if (ret < 0) {
+            tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, SCSI_ASC_WRITE_ERROR, 0x00);
+        }
+    } else {
+        msc_io_flush();     // unusual partial-block access: use the esp_tinyusb path
+        msc_io_invalidate();
+        ret = __real_tud_msc_write10_cb(lun, lba, offset, buffer, bufsize);
+    }
+#else
+    ret = __real_tud_msc_write10_cb(lun, lba, offset, buffer, bufsize);
+#endif
     const int64_t t1 = esp_timer_get_time();
     if (ret > 0) {
         portENTER_CRITICAL(&s_lock);
@@ -153,6 +190,28 @@ int32_t __wrap_tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, ui
         portEXIT_CRITICAL(&s_lock);
     }
     return ret;
+}
+
+// SCSI commands without a TinyUSB built-in handler. With write merging, SYNCHRONIZE CACHE must
+// put all accepted data on the card before the good status. Windows sends PREVENT ALLOW MEDIUM
+// REMOVAL when the drive is ejected, so write back there as well.
+int32_t __wrap_tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, uint16_t bufsize)
+{
+#if CONFIG_BENCH_MSC_FAST_IO
+    const uint8_t op = scsi_cmd[0];
+    if (op == SCSI_OP_SYNCHRONIZE_CACHE_10 || op == SCSI_OP_SYNCHRONIZE_CACHE_16 ||
+            op == SCSI_OP_PREVENT_ALLOW_REMOVAL) {
+        const esp_err_t err = msc_io_flush();
+        if (err != ESP_OK) {
+            tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, SCSI_ASC_WRITE_ERROR, 0x00);
+            return -1;
+        }
+        if (op != SCSI_OP_PREVENT_ALLOW_REMOVAL) {
+            return 0;
+        }
+    }
+#endif
+    return __real_tud_msc_scsi_cb(lun, scsi_cmd, buffer, bufsize);
 }
 
 static inline bool sd_buffer_dma_ok(const sdmmc_card_t *card, const void *buf, size_t len)
@@ -363,6 +422,13 @@ esp_err_t msc_ctrl_take(bool *fs_mounted)
         }
         s_host_access = false;  // from now on host commands get "medium not present"
         vTaskDelay(pdMS_TO_TICKS(TAKE_DRAIN_MS));
+#if CONFIG_BENCH_MSC_FAST_IO
+        const esp_err_t werr = msc_io_flush();      // merged host data goes to the card first
+        if (werr != ESP_OK) {
+            ESP_LOGE(TAG, "write-back of host data failed: %s", esp_err_to_name(werr));
+        }
+        msc_io_invalidate();
+#endif
         ESP_LOGI(TAG, "card taken from the USB host");
     }
 
@@ -404,6 +470,9 @@ esp_err_t msc_ctrl_expose(void)
     // Unmounts the filesystem from /sdcard; all files must be closed (the benchmarks close theirs).
     storage_set_usb_quiet();
     s_fs_mounted = false;
+#if CONFIG_BENCH_MSC_FAST_IO
+    msc_io_invalidate();    // the application may have changed the card
+#endif
     s_media_changed = true;
     s_host_access = true;
     ESP_LOGI(TAG, "card exposed to the USB host");
@@ -453,6 +522,9 @@ void msc_ctrl_reset_counters(void)
     memset(&s_cnt, 0, sizeof(s_cnt));
     memset(s_sess, 0, sizeof(s_sess));
     portEXIT_CRITICAL(&s_lock);
+#if CONFIG_BENCH_MSC_FAST_IO
+    msc_io_reset_counters();
+#endif
 }
 
 void msc_ctrl_set_report(bool on)
@@ -518,6 +590,9 @@ esp_err_t msc_ctrl_init(sdmmc_card_t *card, bool expose)
     if (!s_bounce) {
         ESP_LOGW(TAG, "no internal DMA memory for the %u B bounce buffer", (unsigned)s_bounce_size);
     }
+#if CONFIG_BENCH_MSC_FAST_IO
+    ESP_RETURN_ON_ERROR(msc_io_init(card), TAG, "MSC I/O engine");
+#endif
 
     const tinyusb_msc_driver_config_t drv_cfg = {
         .user_flags = {

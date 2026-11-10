@@ -1,7 +1,8 @@
 # ESP32-S31-Korvo-1 microSD USB High-Speed MSC 속도 측정
 
 > **상태**: 보드에서 SD 카드 동작(High Speed 40 MHz, UHS-I SDR50 100 MHz)과 512 GB exFAT 마운트를 확인했다.
-> 측정값은 [벤치 결과](#벤치-결과)에 있다. USB로 PC에 연결한 측정은 아직 하지 않았다.
+> PC와 USB High-Speed로 연결한 MSC 속도는 쓰기 21.3 MB/s, 읽기 20.2 MB/s다(SDR50, 미리 읽기·쓰기 모으기 적용).
+> 측정값과 병목 분석은 [벤치 결과](#벤치-결과)에 있다.
 
 ## 사용 보드
 
@@ -76,6 +77,64 @@
 - 그래서 쓰기는 버스 상한보다 낮고, 카드 자체 성능의 영향을 크게 받는다.
 
 SDR50에서 읽기 명령 29,605회(1,611 MB)와 쓰기 명령 4,103회(1,074 MB)를 실행했다. SD 오류는 없었다.
+
+### USB MSC 속도 (PC에서 측정)
+
+SDR50 설정에서 USB 2.0 Type-A 포트를 PC에 연결하고 `python tools\msc_bench.py D:`로 측정했다.
+
+- USB는 High-Speed(480 Mbit/s)로 연결됐고, Windows에 exFAT 이동식 디스크(D:)로 나타났다.
+- 조건: 1 GiB 파일, 1 MiB 단위 I/O, Windows 캐시 미사용, 3회 반복, 데이터 검증
+
+두 가지 MSC 경로를 비교했다. 각각 1 GiB를 3회씩 쓰고 읽었고, 모든 회차에서 데이터 검증을 통과했다.
+
+| MSC 경로 | PC 쓰기 (MB/s) | PC 읽기 (MB/s) |
+|---|---|---|
+| esp_tinyusb 기본 경로 (`BENCH_MSC_FAST_IO=n`) | 9.01 | 13.65 |
+| **MSC 엔진: 미리 읽기 + 쓰기 모으기 (기본값)** | **21.29** | **20.23** |
+| 배율 | 2.4배 | 1.5배 |
+
+회차별 값 (장치 값은 장치 로그의 `[msc] ... session` 요약으로, USB로 오간 데이터 양을 구간 시간으로 나눈 값이다):
+
+| MSC 경로 | 회차 | PC 쓰기 | PC 읽기 | 장치 쓰기 | 장치 읽기 | 검증 |
+|---|---|---|---|---|---|---|
+| 기본 경로 | 1 | 9.13 | 13.56 | 9.09 | 13.26 | OK |
+| 기본 경로 | 2 | 8.90 | 13.71 | 8.87 | 13.40 | OK |
+| 기본 경로 | 3 | 9.01 | 13.69 | 8.99 | 13.42 | OK |
+| MSC 엔진 | 1 | 21.38 | 20.22 | 21.19 | 19.42 | OK |
+| MSC 엔진 | 2 | 21.23 | 20.23 | 20.99 | 19.43 | OK |
+| MSC 엔진 | 3 | 21.26 | 20.23 | 20.99 | 19.45 | OK |
+
+측정 구간의 SD 통계(`stats`):
+
+| 항목 | 기본 경로 읽기 | 기본 경로 쓰기 | 엔진 읽기 | 엔진 쓰기 |
+|---|---|---|---|---|
+| SD 명령당 평균 크기 | 32 KiB | 32 KiB | 244.9 KiB | 508.4 KiB |
+| SD busy (전체 시간 중 SD 명령 시간) | 41 % | 79 % | 42 % | 60 % |
+| SD 명령 시간만으로 계산한 속도 | 32.5 MB/s | 11.4 MB/s | 45.8 MB/s | 34.9 MB/s |
+| SD 오류 | 0 | 0 | 0 | 0 |
+
+엔진 카운터: 미리 읽기 적중 98,368회, 실패 77회, 대기 8회, 버린 미리 읽기 0회.
+쓰기 모으기는 SD 명령 6,188회, 주소 불연속으로 끊긴 경우 39회, 버퍼가 빌 때까지 PC가 기다린 경우 42회였다.
+
+**기본 경로에서 막히던 이유** (32 KiB 한 덩어리 기준)
+
+- 읽기 2.40 ms: SD 읽기 1.01 ms와 나머지 1.39 ms(USB 전송, TinyUSB, PC 명령 처리)가 차례로 일어난다.
+  esp_tinyusb는 SD에서 32 KiB를 읽어 USB로 보낸 뒤에야 다음 32 KiB를 읽는다. 두 시간이 겹치지 않고 더해진다.
+- 쓰기 3.64 ms: SD 쓰기 한 번에 2.87 ms가 걸린다. 버스 전송 0.66 ms에 카드 내부 기록 시간 약 2.2 ms가 더해진다.
+  32 KiB마다 SD 명령을 따로 보내므로 이 고정 시간이 매번 붙는다.
+
+**MSC 엔진이 바꾼 것** ([구현 메모](#구현-메모) 참고)
+
+- 읽기: 별도 태스크가 256 KiB 단위로 미리 읽는다. USB 콜백은 메모리 복사만 하므로 SD 읽기와 USB 전송이 겹친다.
+- 쓰기: 주소가 이어지는 덩어리를 512 KiB까지 모아 SD 명령 하나로 쓴다. PC는 그동안 다른 버퍼에 계속 보낸다.
+
+**엔진 적용 뒤 남은 병목**
+
+- SD는 더 이상 병목이 아니다. 읽기 때 42 %, 쓰기 때 60 % 시간만 바쁘다.
+- 32 KiB 한 덩어리에 읽기 1.62 ms, 쓰기 1.54 ms가 걸린다. 대부분 USB 쪽 시간이다.
+- 그중 약 0.3 ms는 PSRAM 버퍼와 TinyUSB 버퍼(내부 RAM) 사이의 memcpy다. 부팅 로그에서 297 µs와 287 µs로 측정됐다.
+- 나머지 약 1.2~1.3 ms는 USB 전송, TinyUSB 처리, PC의 명령 처리 시간이다.
+- 더 올리려면 memcpy를 줄이거나(내부 RAM 버퍼), 한 번에 옮기는 덩어리를 키워야 한다(TinyUSB 상한은 64 KiB 미만).
 
 ## UHS-I SDR50 동작
 
@@ -186,6 +245,7 @@ main/
   app_main.c              초기화 순서, 콘솔 REPL
   sd_card.c               SDMMC 슬롯 0 초기화, 속도 모드, 카드 정보 출력
   msc_ctrl.c              TinyUSB MSC, 카드 소유권 전환, 처리량 통계, 링커 래퍼
+  msc_io.c                MSC 엔진: 미리 읽기, 쓰기 모으기
   bench.c                 rawread, filebench, format, 파일시스템 정보
   cmd_bench.c             콘솔 명령 등록
   Kconfig.projbuild       menuconfig "S31 SD MSC benchmark"
@@ -227,6 +287,11 @@ idf.py --preview -p COM4 flash monitor
 | Expose the card to the USB host at boot | 켬 | 부팅 직후 PC가 카드를 쓸 수 있다 |
 | MSC throughput report period | 1000 ms | `[msc]` 줄 출력 주기 |
 | Idle time that closes a transfer session | 2000 ms | 이 시간 동안 전송이 없으면 세션 요약을 출력한다 |
+| MSC read-ahead and write merging | 켬 | MSC 엔진. 끄면 esp_tinyusb 기본 경로로 동작한다 |
+| Read-ahead buffer size | 256 KiB | 미리 읽기 버퍼 하나의 크기. 버퍼는 두 개다 |
+| Put the read-ahead buffers in internal RAM | 끔 | 켜면 memcpy가 빨라지지만 내부 RAM 여유가 약 300 KiB뿐이다 |
+| Write merge buffer size | 512 KiB | 쓰기 모으기 버퍼 하나의 크기. 버퍼는 두 개이고 PSRAM에 둔다 |
+| Write back merged data after this host idle time | 20 ms | PC 쓰기가 이 시간 동안 없으면 모아 둔 데이터를 카드에 쓴다 |
 
 기본값은 `sdkconfig.defaults`에 있다.
 모드별 클럭과 버스 상한, 1.8 V 전환 과정은 [UHS-I SDR50 동작](#uhs-i-sdr50-동작)에 정리했다.
@@ -322,10 +387,13 @@ s31> expose
 ## 결과 해석
 
 PC 측 값이 SD 버스 상한보다 많이 낮으면 다음을 확인한다.
+이 보드에서 측정한 수치와 시간 분해는 [USB MSC 속도](#usb-msc-속도-pc에서-측정)에 있다.
+아래 두 항목은 MSC 엔진을 끈 기본 경로의 동작이다. 엔진을 켜면 SD 접근이 USB 전송과 겹치고 SD 명령이 커진다.
 
 - esp_tinyusb의 MSC 읽기는 SD에서 32 KiB를 읽어 USB로 보낸 뒤에 다음 32 KiB를 읽는다.
   SD 읽기와 USB 전송이 겹치지 않으므로 MSC 읽기 속도는 대략 1 / (1/SD 속도 + 1/USB 속도)가 된다.
 - 쓰기는 USB 수신과 이전 블록의 SD 쓰기가 일부 겹친다. esp_tinyusb가 SD 쓰기를 TinyUSB 태스크로 미뤄 처리하기 때문이다.
+  대신 SD 쓰기가 32 KiB 단위라 명령마다 카드 기록 고정 시간이 붙는다.
 - PC가 보내는 큰 READ(10)/WRITE(10)도 장치 안에서는 32 KiB 단위로 나뉜다.
   ESP32-S31의 MSC 버퍼 상한이 32 KiB(`CONFIG_TINYUSB_MSC_BUFSIZE`)이기 때문이다.
   그래서 `rawread`의 32 KiB 행이 MSC 경로의 SD 성능에 가장 가깝다(High Speed 17.54 MB/s, SDR50 36.27 MB/s).
@@ -340,13 +408,38 @@ PC 측 값이 SD 버스 상한보다 많이 낮으면 다음을 확인한다.
 - **자동 포맷 금지**: 마운트에 실패해도 카드를 포맷하지 않는다(`do_not_format`).
 - **PC 접근 차단**: 앱이 카드를 가진 동안 PC의 TEST UNIT READY, READ(10), WRITE(10)에 "매체 없음"으로 응답한다.
   카드를 돌려줄 때는 "매체가 바뀌었을 수 있음"(UNIT ATTENTION)을 한 번 보내 PC가 카드를 다시 읽게 한다.
-- **링커 래퍼**: `main/CMakeLists.txt`에서 `-Wl,--wrap`으로 다섯 함수를 감싼다.
-  - `tud_msc_test_unit_ready_cb`, `tud_msc_read10_cb`, `tud_msc_write10_cb`: USB 바이트 수 집계, PC 접근 차단
+- **링커 래퍼**: `main/CMakeLists.txt`에서 `-Wl,--wrap`으로 여섯 함수를 감싼다.
+  - `tud_msc_test_unit_ready_cb`, `tud_msc_read10_cb`, `tud_msc_write10_cb`: USB 바이트 수 집계, PC 접근 차단, MSC 엔진 연결
+  - `tud_msc_scsi_cb`: SYNCHRONIZE CACHE와 꺼내기 때 모아 둔 쓰기 데이터를 카드에 쓴다
   - `sdmmc_read_sectors`, `sdmmc_write_sectors`: SD 점유 시간 측정, 비정렬 버퍼 복사
 - **비정렬 버퍼 복사**: esp_tinyusb의 쓰기 버퍼는 구조체 안 28바이트 위치에 있어 캐시 라인 정렬이 보장되지 않는다.
   SDMMC 드라이버는 정렬되지 않은 버퍼를 8 KiB씩 나눠 보낸다.
   그래서 32 KiB 정렬 버퍼에 한 번 복사해 SD 명령 하나로 보낸다. 복사 횟수는 `stats`의 bounce 항목에 나온다.
+  ESP32-S31에서는 USB MSC 측정 중 복사가 한 번도 일어나지 않았다. 쓰기 버퍼가 드라이버의 정렬 검사를 통과했다.
+  다른 칩이나 라이브러리 버전에서 정렬 조건이 달라질 때를 대비해 남겨 두었다.
 - **용량**: READ(10)/WRITE(10)의 32비트 LBA를 쓰므로 2 TiB 카드까지 다룰 수 있다.
+
+### MSC 엔진 (`main/msc_io.c`)
+
+TinyUSB는 MSC 데이터를 32 KiB 덩어리로 옮기고 덩어리마다 READ(10)/WRITE(10) 콜백을 부른다.
+엔진은 이 콜백(링커 래퍼) 안에서 esp_tinyusb 대신 카드 접근을 맡는다.
+
+- **미리 읽기**: 버퍼 두 개(기본 256 KiB씩)를 번갈아 쓴다.
+  PC가 이어지는 주소를 읽으면 `msc_io` 태스크가 다음 구간을 카드에서 미리 읽는다.
+  콜백은 버퍼에서 TinyUSB 버퍼로 복사만 한다.
+- **쓰기 모으기**: 버퍼 두 개(기본 512 KiB씩)를 번갈아 쓴다.
+  주소가 이어지는 덩어리를 모았다가 `msc_io` 태스크가 SD 명령 하나로 쓴다. 그동안 PC는 다른 버퍼로 계속 보낸다.
+- **일관성**
+  - 쓰기가 들어오면 미리 읽은 데이터를 버린다. 진행 중인 미리 읽기는 세대 번호로 무효 처리한다.
+  - 읽기가 들어오면 모아 둔 쓰기 데이터를 먼저 카드에 쓴다.
+- **모아 둔 데이터를 카드에 쓰는 시점**
+  - PC 쓰기가 20 ms 동안 없을 때
+  - SYNCHRONIZE CACHE, PREVENT ALLOW MEDIUM REMOVAL(꺼내기) 명령을 받을 때
+  - `mount`로 카드를 가져올 때
+- **주의 (write-back)**: PC는 데이터가 카드에 기록되기 전에 완료 응답을 받는다.
+  쓰기 직후 20 ms 안에 전원이 끊기면 최대 1 MiB(512 KiB × 2)를 잃을 수 있다.
+  백그라운드 쓰기가 실패하면 다음 WRITE(10)나 SYNCHRONIZE CACHE에 오류로 알린다.
+  안전이 더 중요하면 menuconfig에서 엔진을 끈다.
 
 ## 확인한 범위
 
@@ -359,13 +452,13 @@ PC 측 값이 SD 버스 상한보다 많이 낮으면 다음을 확인한다.
 - exFAT 코드(`load_xdir`, `change_bitmap` 등)가 링크된 것을 확인했다.
 - `tools/msc_bench.py`를 PC의 로컬 NTFS 드라이브에서 실행했다.
   쓰기, 읽기, 검증, 테스트 파일 삭제가 동작했다.
-
 - 보드에서 부팅, PSRAM(Octal 200 MHz), 512 GB 카드 인식, exFAT 진단과 마운트가 정상이었다.
+- 보드를 PC에 USB High-Speed로 연결해 MSC로 쓰고 읽었다. 기본 경로와 MSC 엔진에서 각각 3 GiB씩이다.
+  데이터 검증과 SD 오류 모두 문제없었다.
 - 측정값은 [벤치 결과](#벤치-결과), SDR50 진입 과정은 [UHS-I SDR50 동작](#uhs-i-sdr50-동작)에 있다.
 
 아직 확인하지 않은 것:
 
-- USB로 PC에 연결한 측정(USB 열거, MSC 속도)
-- Type-A 포트를 PC에 연결할 때의 VBUS 처리(위 주의 참고)
+- Type-A 포트를 PC에 연결할 때의 VBUS 처리(위 주의 참고). 어떤 케이블과 VBUS 연결로 측정했는지는 기록하지 않았다.
 - SD 신호선의 실제 1.8 V 진폭(오실로스코프 측정)
 - High Speed 50 MHz 동작

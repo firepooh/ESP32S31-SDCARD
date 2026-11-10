@@ -11,6 +11,9 @@
 #include "argtable3/argtable3.h"
 #include "sd_card.h"
 #include "msc_ctrl.h"
+#if CONFIG_BENCH_MSC_FAST_IO
+#include "msc_io.h"
+#endif
 #include "bench.h"
 #include "cmd_bench.h"
 
@@ -111,6 +114,18 @@ static int cmd_stats(int argc, char **argv)
     printf("  bounce buffer %u KiB: %" PRIu32 " reads, %" PRIu32 " writes copied\n",
            (unsigned)(msc_ctrl_bounce_size() / 1024), c.bounce_rd, c.bounce_wr);
     printf("  host requests refused while the application owned the card: %" PRIu32 "\n", c.host_rejects);
+#if CONFIG_BENCH_MSC_FAST_IO
+    msc_io_counters_t io;
+    msc_io_get_counters(&io);
+    printf("  MSC engine: %s\n", msc_io_describe());
+    printf("    read : %" PRIu32 " hits, %" PRIu32 " misses, %" PRIu32 " waits, %" PRIu32
+           " prefetches (%" PRIu32 " dropped)\n",
+           io.ra_hits, io.ra_misses, io.ra_waits, io.ra_prefetches, io.ra_dropped);
+    printf("    write: %" PRIu32 " SD commands (avg %.1f KiB), %" PRIu32 " breaks, %" PRIu32
+           " idle, %" PRIu32 " read, %" PRIu32 " sync write-backs, %" PRIu32 " host waits, %" PRIu32 " errors\n",
+           io.wb_cmds, io.wb_cmds ? io.wb_bytes / 1024.0 / io.wb_cmds : 0.0, io.wb_breaks,
+           io.wb_idle_flushes, io.wb_read_flushes, io.wb_sync_flushes, io.wb_waits, io.wb_errors);
+#endif
     printf("  periodic report: %s\n", msc_ctrl_get_report() ? "on" : "off");
     return 0;
 }

@@ -95,6 +95,45 @@ menu "S31 SD MSC benchmark"
             If enabled the PC sees the card right after boot. Otherwise the application owns the
             card (filesystem mounted at /sdcard) until the "expose" console command.
 
+    config BENCH_MSC_FAST_IO
+        bool "MSC read-ahead and write merging"
+        default y
+        help
+            TinyUSB calls READ(10)/WRITE(10) once per 32 KiB chunk. esp_tinyusb serves each chunk
+            with its own SD command, so SD time and USB time add up and every SD write pays the
+            card's per-command programming time.
+            With this option a separate task reads ahead while USB sends, and merges contiguous
+            written chunks into large SD writes (write-back). Merged data is written back after
+            BENCH_MSC_WB_IDLE_MS of host idle time, on SYNCHRONIZE CACHE and on eject.
+            Removing power right after a write can lose up to 2 x BENCH_MSC_WB_KB.
+            Disable to measure the plain esp_tinyusb path.
+
+    config BENCH_MSC_RA_KB
+        int "Read-ahead buffer size (KiB, two buffers)"
+        depends on BENCH_MSC_FAST_IO
+        range 64 4096
+        default 256
+
+    config BENCH_MSC_RA_INTERNAL
+        bool "Put the read-ahead buffers in internal RAM (else PSRAM)"
+        depends on BENCH_MSC_FAST_IO
+        default n
+        help
+            Internal RAM makes the copy into the TinyUSB buffer faster but there is only about
+            300 KiB free. Use 64 KiB buffers with this option.
+
+    config BENCH_MSC_WB_KB
+        int "Write merge buffer size (KiB, two buffers)"
+        depends on BENCH_MSC_FAST_IO
+        range 64 8192
+        default 512
+
+    config BENCH_MSC_WB_IDLE_MS
+        int "Write back merged data after this host idle time (ms)"
+        depends on BENCH_MSC_FAST_IO
+        range 1 1000
+        default 20
+
     config BENCH_STATS_PERIOD_MS
         int "MSC throughput report period (ms)"
         range 200 10000
