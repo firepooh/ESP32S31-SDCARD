@@ -2,7 +2,10 @@
 build/
 sdkconfig.old
 managed_components/
-dependencies.lock
+# CI가 태그 이름으로 만드는 앱 버전 파일
+version.txt
+# 웹 플래셔 로컬 시험용 폴더
+site/
 
 # Python
 __pycache__/

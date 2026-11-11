@@ -287,6 +287,12 @@ main/
 components/fatfs/         ESP-IDF v6.1 fatfs 복사본 (exFAT 켬)
 docs/images/              보드 사진, microSD 회로도
 tools/msc_bench.py        PC 측 순차 쓰기·읽기 측정 (Windows)
+dependencies.lock         컴포넌트 버전 고정 (esp_tinyusb 2.2.0, tinyusb 0.19.0~3)
+.github/workflows/
+  release.yml             v* 태그 → IDF v6.1 빌드 → GitHub 릴리즈
+  pages.yml               릴리즈 바이너리를 모아 웹 플래셔를 GitHub Pages에 배포
+.github/release-notes.md  릴리즈 본문 템플릿
+web/index.html            웹 플래셔 (esptool-js)
 ```
 
 ## 빌드
@@ -307,6 +313,51 @@ idf.py --preview -p COM4 flash monitor
 - `sdkconfig`를 지웠다면 먼저 `idf.py --preview set-target esp32s31`을 실행한다.
   이때 `sdkconfig.defaults`로 설정이 다시 만들어진다.
 - 첫 빌드에서 컴포넌트 매니저가 esp_tinyusb 2.2.0과 tinyusb 0.19.0~3을 `managed_components`에 받는다.
+
+## 릴리즈와 웹 플래셔
+
+`v`로 시작하는 태그를 푸시하면 GitHub Actions가 펌웨어를 빌드해 릴리즈에 올린다.
+그 뒤 웹 플래셔 페이지도 다시 만들어 새 버전을 목록에 넣는다.
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+| 단계 | 워크플로 | 내용 |
+|---|---|---|
+| 빌드 | `release.yml` | `espressif/idf:v6.1` Docker 이미지에서 `idf.py --preview build`와 `merge-bin`을 실행한다 |
+| 릴리즈 | `release.yml` | `*-merged.bin`, `*-all.zip`, `SHA256SUMS.txt`를 태그 릴리즈에 올린다 |
+| 웹 플래셔 | `pages.yml` | 모든 릴리즈의 merged.bin과 `manifest.json`을 모아 GitHub Pages에 배포한다 |
+
+- 앱 버전은 태그 이름이다. CI가 `version.txt`를 만들어 IDF에 넘긴다.
+- `v1.1.0-rc1`처럼 `-`가 들어간 태그는 프리릴리즈로 올린다.
+- GitHub 웹에서 릴리즈를 먼저 만들어도 된다. 이때는 릴리즈 본문은 그대로 두고 파일만 추가한다.
+- Actions 탭에서 `Release build`를 수동 실행하면 릴리즈 없이 빌드 결과만 아티팩트로 남긴다.
+- CI도 로컬과 같은 컴포넌트 버전으로 빌드하도록 `dependencies.lock`을 저장소에 넣었다.
+  MSC 엔진은 esp_tinyusb 내부 함수를 링커 래퍼로 가로채므로 버전이 바뀌면 동작을 보장할 수 없다.
+
+### 웹 플래셔
+
+주소: <https://firepooh.github.io/ESP32S31-SDCARD/>
+
+1. 데스크톱 Chrome이나 Edge에서 연다. Web Serial을 쓰므로 다른 브라우저는 안 된다.
+2. Korvo-1의 Type-C UART 포트를 PC에 연결한다.
+3. 버전을 고르고 **연결**과 **플래시**를 차례로 누른다. 칩이 ESP32-S31이 아니면 굽지 않는다.
+
+- 플래시 엔진은 esptool-js 0.7.1이다. ESP32-S31은 0.7.0부터 지원한다.
+- 기본값은 스텁 없이 ROM 로더로 굽는 것이다. IDF v6.1도 ESP32-S31을 `--no-stub`으로 굽는다.
+- 펌웨어 파일은 페이지와 같은 도메인(`firmware/<태그>/`)에 둔다.
+  브라우저 스크립트는 CORS 제한 때문에 GitHub 릴리즈 파일을 직접 읽을 수 없다.
+- 페이지는 내려받은 파일의 SHA-256을 `manifest.json` 값과 비교한 뒤 굽는다.
+
+처음 한 번은 저장소 설정에서 Pages를 켜야 한다. **Settings > Pages > Source**를 **GitHub Actions**로 바꾼다.
+
+확인한 범위:
+
+- 로컬 IDF v6.1에서 CI와 같은 빌드, `merge-bin`, 패키징 명령을 실행해 결과 파일을 확인했다.
+- 웹 플래셔를 로컬 서버로 띄워 목록 표시, 파일 내려받기, esptool-js 로드를 확인했다.
+- GitHub Actions 실행, Pages 배포, 웹 플래셔로 실제 보드에 굽는 것은 아직 확인하지 않았다.
 
 ## menuconfig 설정
 
