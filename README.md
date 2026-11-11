@@ -1,3 +1,5 @@
+**한국어** | [English](README.en.md)
+
 # ESP32-S31-Korvo-1 microSD USB High-Speed MSC 속도 측정
 
 ESP32-S31-Korvo-1의 microSD 카드를 USB 2.0 High-Speed MSC로 PC에 연결한다.
